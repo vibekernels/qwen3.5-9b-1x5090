@@ -17,21 +17,71 @@ void launch_bf16_to_f32(float* output, const __nv_bfloat16* input, int n, cudaSt
     bf16_to_f32_kernel<<<cdiv(n, 256), 256, 0, stream>>>(output, input, n);
 }
 
+// GPU argmax kernel - reduces vocab to find max token ID
+__global__ void argmax_kernel(
+    int* __restrict__ result,
+    float* __restrict__ result_val,
+    const float* __restrict__ logits,
+    int n
+) {
+    extern __shared__ char smem_raw[];
+    float* s_vals = (float*)smem_raw;
+    int* s_idxs = (int*)(smem_raw + blockDim.x * sizeof(float));
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float best_val = -1e30f;
+    int best_idx = 0;
+    for (int i = tid; i < n; i += stride) {
+        float v = logits[i];
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+
+    s_vals[tid] = best_val;
+    s_idxs[tid] = best_idx;
+    __syncthreads();
+
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s && s_vals[tid + s] > s_vals[tid]) {
+            s_vals[tid] = s_vals[tid + s];
+            s_idxs[tid] = s_idxs[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *result = s_idxs[0];
+        *result_val = s_vals[0];
+    }
+}
+
+static int* g_argmax_result = nullptr;
+static float* g_argmax_val = nullptr;
+
+static int gpu_argmax(float* logits_device, int vocab_size) {
+    if (!g_argmax_result) {
+        g_argmax_result = cuda_alloc<int>(1);
+        g_argmax_val = cuda_alloc<float>(1);
+    }
+    int threads = 1024;
+    size_t smem = threads * (sizeof(float) + sizeof(int));
+    argmax_kernel<<<1, threads, smem>>>(g_argmax_result, g_argmax_val, logits_device, vocab_size);
+    int result;
+    cuda_download(&result, g_argmax_result, 1);
+    return result;
+}
+
 // Simple CPU-side sampling (good enough for single-token generation)
 int sample_token(float* logits_device, int vocab_size, float temperature, int top_k, float top_p) {
-    // Download logits to host
+    // Greedy (argmax) for temperature <= 0 — done on GPU
+    if (temperature <= 0.0f) {
+        return gpu_argmax(logits_device, vocab_size);
+    }
+
+    // Download logits to host for non-greedy sampling
     std::vector<float> logits(vocab_size);
     cuda_download(logits.data(), logits_device, vocab_size);
-
-    // Greedy (argmax) for temperature <= 0
-    if (temperature <= 0.0f) {
-        int best = 0;
-        for (int i = 1; i < vocab_size; i++) {
-            if (logits[i] > logits[best]) best = i;
-        }
-        fprintf(stderr, "[SAMPLER] greedy: %d (%.4f), logits[528]=%.4f\n", best, logits[best], logits[528]);
-        return best;
-    }
 
     // Apply temperature
     float inv_temp = 1.0f / temperature;

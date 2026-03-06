@@ -49,6 +49,7 @@ struct AttentionLayerWeights {
     __nv_bfloat16* wq;               // [n_embd, n_head * head_dim * 2] = [4096, 8192] (Q + gate packed)
     __nv_bfloat16* wk;               // [n_embd, n_head_kv * head_dim] = [4096, 1024]
     __nv_bfloat16* wv;               // [n_embd, n_head_kv * head_dim] = [4096, 1024]
+    __nv_bfloat16* wkv;              // packed K+V [n_embd, 2 * n_head_kv * head_dim] = [4096, 2048]
     __nv_bfloat16* wo;               // [n_head * head_dim, n_embd] = [4096, 4096]
     float*         attn_q_norm;      // [head_dim] = [256] (F32 in GGUF)
     float*         attn_k_norm;      // [head_dim] = [256] (F32 in GGUF)
@@ -58,6 +59,7 @@ struct AttentionLayerWeights {
     __nv_bfloat16* ffn_gate;         // [n_embd, n_ff] = [4096, 12288]
     __nv_bfloat16* ffn_up;           // [n_embd, n_ff] = [4096, 12288]
     __nv_bfloat16* ffn_down;         // [n_ff, n_embd] = [12288, 4096]
+    __nv_bfloat16* ffn_gate_up;      // [n_embd, 2*n_ff] = [4096, 24576] packed gate+up
 };
 
 // SSM (delta-net) layer weights
@@ -65,6 +67,7 @@ struct SSMLayerWeights {
     float*         attn_norm;        // [n_embd] (F32 in GGUF)
     __nv_bfloat16* wqkv;             // [n_embd, ssm_conv_channels] = [4096, 8192]
     __nv_bfloat16* wqkv_gate;        // [n_embd, ssm_d_inner] = [4096, 4096]  (attn_gate in GGUF)
+    __nv_bfloat16* w_combined;       // packed [n_embd, 8192+4096+32+32] = [4096, 12352]
 
     // SSM params
     float*         ssm_a;            // [ssm_dt_rank] = [32]
@@ -81,6 +84,7 @@ struct SSMLayerWeights {
     __nv_bfloat16* ffn_gate;         // [n_embd, n_ff]
     __nv_bfloat16* ffn_up;           // [n_embd, n_ff]
     __nv_bfloat16* ffn_down;         // [n_ff, n_embd]
+    __nv_bfloat16* ffn_gate_up;      // [n_embd, 2*n_ff] packed gate+up
 };
 
 // Combined layer (union-like, selected by is_recurrent)
@@ -141,6 +145,14 @@ struct Model {
     // SSM state for delta-net layers
     float* ssm_conv_state[24];       // [(conv_kernel-1) * conv_channels] per SSM layer
     float* ssm_recurrent_state[24];  // [num_v_heads * head_v_dim * head_v_dim] = [32*128*128] per SSM layer
+
+    // Pre-allocated SSM temp buffers (avoid cudaMalloc/Free per token)
+    float* ssm_gate_buf;             // [max_tokens * ssm_dt_rank]
+    float* ssm_beta_buf;             // [max_tokens * ssm_dt_rank]
+    float* ssm_conv_out_buf;         // [max_tokens * ssm_conv_channels]
+    float* ssm_q_rep_buf;            // [ssm_dt_rank * ssm_d_state]
+    float* ssm_k_rep_buf;            // [ssm_dt_rank * ssm_d_state]
+    float* ssm_delta_out_buf;        // [ssm_dt_rank * ssm_head_v_dim]
 
     int max_tokens;                  // max batch tokens allocated
     int max_kv_len;                  // max KV cache length

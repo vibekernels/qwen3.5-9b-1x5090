@@ -293,6 +293,86 @@ bool load_model(const std::string& path, Model& model) {
     }
 
     fclose(f);
+
+    // Pack attention K+V weights for fused GEMM
+    {
+        int kv_dim = ModelConfig::n_head_kv * ModelConfig::head_dim;  // 1024
+        int k = ModelConfig::n_embd;
+        for (int il = 0; il < ModelConfig::n_layers; il++) {
+            if (ModelConfig::is_recurrent(il)) continue;
+            int ai = model.layer_subidx[il];
+            auto& lw = model.attn_layers[ai];
+            lw.wkv = cuda_alloc<__nv_bfloat16>(2 * kv_dim * k);
+            CUDA_CHECK(cudaMemcpy(lw.wkv, lw.wk,
+                (size_t)kv_dim * k * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(lw.wkv + (size_t)kv_dim * k, lw.wv,
+                (size_t)kv_dim * k * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+        }
+    }
+
+    // Pack SSM combined weights: QKV(8192) + Z(4096) + alpha(32) + beta(32) = 12352
+    {
+        int combined_n = ModelConfig::ssm_conv_channels + ModelConfig::ssm_d_inner
+                       + ModelConfig::ssm_dt_rank + ModelConfig::ssm_dt_rank;  // 12352
+        int k = ModelConfig::n_embd;  // 4096
+
+        for (int il = 0; il < ModelConfig::n_layers; il++) {
+            if (!ModelConfig::is_recurrent(il)) continue;
+            int si = model.layer_subidx[il];
+            auto& lw = model.ssm_layers[si];
+
+            lw.w_combined = cuda_alloc<__nv_bfloat16>((size_t)combined_n * k);
+
+            size_t off = 0;
+            // QKV: [8192, 4096]
+            CUDA_CHECK(cudaMemcpy(lw.w_combined + off, lw.wqkv,
+                (size_t)ModelConfig::ssm_conv_channels * k * sizeof(__nv_bfloat16),
+                cudaMemcpyDeviceToDevice));
+            off += (size_t)ModelConfig::ssm_conv_channels * k;
+
+            // Z gate: [4096, 4096]
+            CUDA_CHECK(cudaMemcpy(lw.w_combined + off, lw.wqkv_gate,
+                (size_t)ModelConfig::ssm_d_inner * k * sizeof(__nv_bfloat16),
+                cudaMemcpyDeviceToDevice));
+            off += (size_t)ModelConfig::ssm_d_inner * k;
+
+            // Alpha: [32, 4096]
+            CUDA_CHECK(cudaMemcpy(lw.w_combined + off, lw.ssm_alpha,
+                (size_t)ModelConfig::ssm_dt_rank * k * sizeof(__nv_bfloat16),
+                cudaMemcpyDeviceToDevice));
+            off += (size_t)ModelConfig::ssm_dt_rank * k;
+
+            // Beta: [32, 4096]
+            CUDA_CHECK(cudaMemcpy(lw.w_combined + off, lw.ssm_beta,
+                (size_t)ModelConfig::ssm_dt_rank * k * sizeof(__nv_bfloat16),
+                cudaMemcpyDeviceToDevice));
+        }
+    }
+
+    // Pack FFN gate+up weights for fused GEMM
+    // gate: [n_ff, n_embd], up: [n_ff, n_embd] → packed: [2*n_ff, n_embd]
+    int n_ff = ModelConfig::n_ff;
+    int n_embd = ModelConfig::n_embd;
+    for (int il = 0; il < ModelConfig::n_layers; il++) {
+        if (ModelConfig::is_recurrent(il)) {
+            int si = model.layer_subidx[il];
+            auto& lw = model.ssm_layers[si];
+            lw.ffn_gate_up = cuda_alloc<__nv_bfloat16>(2 * n_ff * n_embd);
+            CUDA_CHECK(cudaMemcpy(lw.ffn_gate_up, lw.ffn_gate,
+                (size_t)n_ff * n_embd * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(lw.ffn_gate_up + (size_t)n_ff * n_embd, lw.ffn_up,
+                (size_t)n_ff * n_embd * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+        } else {
+            int ai = model.layer_subidx[il];
+            auto& lw = model.attn_layers[ai];
+            lw.ffn_gate_up = cuda_alloc<__nv_bfloat16>(2 * n_ff * n_embd);
+            CUDA_CHECK(cudaMemcpy(lw.ffn_gate_up, lw.ffn_gate,
+                (size_t)n_ff * n_embd * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(lw.ffn_gate_up + (size_t)n_ff * n_embd, lw.ffn_up,
+                (size_t)n_ff * n_embd * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+        }
+    }
+
     printf("Model loaded successfully.\n");
 
     // Initialize cuBLAS

@@ -201,6 +201,131 @@ __global__ void attention_decode_kernel(
     }
 }
 
+// Batched attention for prefill: handle n_tokens > 1 with causal masking
+// Q: [n_tokens, n_head, head_dim]
+// K_cache, V_cache: already contain [kv_start + n_tokens] entries
+// Each query q_t attends to kv positions 0..(kv_start + t), inclusive
+__global__ void attention_prefill_kernel(
+    __nv_bfloat16* __restrict__ output,    // [n_tokens, n_head, head_dim]
+    const __nv_bfloat16* __restrict__ q,   // [n_tokens, n_head, head_dim]
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    int n_tokens,
+    int kv_start,        // KV positions before this prefill
+    int n_head,
+    int n_head_kv,
+    int head_dim,
+    float scale
+) {
+    // blockIdx.x = token * n_head + head
+    const int block_id = blockIdx.x;
+    const int token = block_id / n_head;
+    const int head = block_id % n_head;
+    const int kv_head = head / (n_head / n_head_kv);
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    int kv_len = kv_start + token + 1; // causal: can see up to own position
+
+    extern __shared__ float smem[];
+    float* scores = smem;
+
+    const __nv_bfloat16* q_head = q + ((int64_t)token * n_head + head) * head_dim;
+
+    // Compute Q . K^T for all valid KV positions
+    for (int kv_pos = tid; kv_pos < kv_len; kv_pos += stride) {
+        const __nv_bfloat16* k_vec = k_cache + (int64_t)kv_pos * n_head_kv * head_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += __bfloat162float(q_head[d]) * __bfloat162float(k_vec[d]);
+        }
+        scores[kv_pos] = dot * scale;
+    }
+    __syncthreads();
+
+    // Softmax: find max
+    float max_val = -FLT_MAX;
+    for (int i = tid; i < kv_len; i += stride) {
+        max_val = fmaxf(max_val, scores[i]);
+    }
+    __shared__ float warp_maxes[32];
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, offset));
+    }
+    if (lane_id == 0) warp_maxes[warp_id] = max_val;
+    __syncthreads();
+    __shared__ float s_max;
+    if (warp_id == 0) {
+        float v = (lane_id < (stride / 32)) ? warp_maxes[lane_id] : -FLT_MAX;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));
+        }
+        if (lane_id == 0) s_max = v;
+    }
+    __syncthreads();
+
+    // Exp and sum
+    float sum_exp = 0.0f;
+    for (int i = tid; i < kv_len; i += stride) {
+        scores[i] = expf(scores[i] - s_max);
+        sum_exp += scores[i];
+    }
+    __shared__ float warp_sums[32];
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_exp += __shfl_down_sync(0xffffffff, sum_exp, offset);
+    }
+    if (lane_id == 0) warp_sums[warp_id] = sum_exp;
+    __syncthreads();
+    __shared__ float s_sum;
+    if (warp_id == 0) {
+        float v = (lane_id < (stride / 32)) ? warp_sums[lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        }
+        if (lane_id == 0) s_sum = v;
+    }
+    __syncthreads();
+
+    float inv_sum = 1.0f / s_sum;
+    for (int i = tid; i < kv_len; i += stride) {
+        scores[i] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Weighted sum of V
+    __nv_bfloat16* out_head = output + ((int64_t)token * n_head + head) * head_dim;
+    for (int d = tid; d < head_dim; d += stride) {
+        float acc = 0.0f;
+        for (int kv_pos = 0; kv_pos < kv_len; kv_pos++) {
+            const __nv_bfloat16* v_vec = v_cache + (int64_t)kv_pos * n_head_kv * head_dim + kv_head * head_dim;
+            acc += scores[kv_pos] * __bfloat162float(v_vec[d]);
+        }
+        out_head[d] = __float2bfloat16(acc);
+    }
+}
+
+void launch_attention_prefill(
+    __nv_bfloat16* output,
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* k_cache,
+    const __nv_bfloat16* v_cache,
+    int n_tokens,
+    int kv_start,
+    int n_head,
+    int n_head_kv,
+    int head_dim,
+    float scale,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    int total_kv = kv_start + n_tokens;
+    size_t smem = total_kv * sizeof(float);
+    attention_prefill_kernel<<<n_tokens * n_head, threads, smem, stream>>>(
+        output, q, k_cache, v_cache, n_tokens, kv_start, n_head, n_head_kv, head_dim, scale);
+}
+
 void launch_attention_decode(
     __nv_bfloat16* output,
     const __nv_bfloat16* q,

@@ -147,6 +147,81 @@ void launch_rmsnorm_f32in(
     rmsnorm_f32in_kernel<<<n_tokens, threads, 0, stream>>>(output, input, weight, dim, eps);
 }
 
+// Fused residual add + RMSNorm: hidden(f32) = hidden(f32) + residual(f32), then y(bf16) = rmsnorm(hidden)
+// Reads hidden and residual, writes updated hidden and normalized output in one pass
+__global__ void fused_residual_rmsnorm_kernel(
+    __nv_bfloat16* __restrict__ norm_output,
+    float* __restrict__ hidden,
+    const float* __restrict__ residual,
+    const float* __restrict__ weight,
+    int dim,
+    float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    float* h = hidden + row * dim;
+    const float* r = residual + row * dim;
+    __nv_bfloat16* y = norm_output + row * dim;
+
+    // Pass 1: add residual and compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += stride) {
+        float val = h[i] + r[i];
+        h[i] = val;  // write back updated hidden
+        sum_sq += val * val;
+    }
+
+    // Warp reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    __shared__ float shared[32];
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        sum_sq = (lane_id < (stride / 32)) ? shared[lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        }
+    }
+
+    __shared__ float s_rms_scale;
+    if (tid == 0) {
+        s_rms_scale = rsqrtf(sum_sq / dim + eps);
+    }
+    __syncthreads();
+
+    float rms_scale = s_rms_scale;
+
+    // Pass 2: normalize and write bf16 output
+    for (int i = tid; i < dim; i += stride) {
+        float val = h[i];
+        float w = weight[i];
+        y[i] = __float2bfloat16(val * rms_scale * w);
+    }
+}
+
+void launch_fused_residual_rmsnorm(
+    __nv_bfloat16* norm_output,
+    float* hidden,
+    const float* residual,
+    const float* weight,
+    int n_tokens,
+    int dim,
+    float eps,
+    cudaStream_t stream
+) {
+    int threads = (dim < 1024) ? dim : 1024;
+    threads = ((threads + 31) / 32) * 32;
+    fused_residual_rmsnorm_kernel<<<n_tokens, threads, 0, stream>>>(
+        norm_output, hidden, residual, weight, dim, eps);
+}
+
 // RMSNorm applied per-head (for Q/K normalization)
 // Input shape: [n_tokens, n_heads, head_dim]
 // Weight shape: [head_dim]
