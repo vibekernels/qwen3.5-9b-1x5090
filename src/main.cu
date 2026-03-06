@@ -1025,6 +1025,26 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
     g_temperature = temperature;
 
     int n_prompt = (int)prompt_tokens.size();
+    int max_kv = g_model.max_kv_len;
+
+    // Check if prompt alone exceeds context
+    if (n_prompt >= max_kv) {
+        fprintf(stderr, "Prompt (%d tokens) exceeds context limit (%d). Truncating.\n", n_prompt, max_kv);
+        n_prompt = max_kv - 1;  // leave room for at least 1 generated token
+    }
+
+    // Clamp max_tokens so we don't exceed context during decode
+    int remaining = max_kv - (g_model.kv_len + n_prompt);
+    if (remaining < 1) {
+        fprintf(stderr, "Context full (kv_len=%d + prompt=%d >= %d). Cannot generate.\n",
+                g_model.kv_len, n_prompt, max_kv);
+        if (stop_reason) *stop_reason = STOP_LENGTH;
+        return 0;
+    }
+    if (max_tokens > remaining) {
+        max_tokens = remaining;
+    }
+
     int next_token = -1;
 
     // Prefill
