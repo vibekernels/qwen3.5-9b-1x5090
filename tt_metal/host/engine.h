@@ -32,6 +32,10 @@ struct AttentionLayerBuffers {
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> post_attn_norm;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_gate_up;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_down;
+    // Host-side BF16 cache for fast inference (avoids PCIe reads per token)
+    std::vector<uint16_t> wqkv_host;
+    std::vector<uint16_t> ffn_gate_up_host;
+    std::vector<uint16_t> ffn_down_host;
 };
 
 // Weights for a single SSM (delta-net) layer.
@@ -39,13 +43,17 @@ struct SSMLayerBuffers {
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_norm;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> w_combined;
     std::vector<float> ssm_a_host;       // [ssm_dt_rank] = [32]
-    std::vector<float> ssm_conv1d_host;  // [channels * kernel] = [8192 * 4] (transposed to [ch, k])
+    std::vector<float> ssm_conv1d_host;  // [channels * kernel] = [8192 * 4]
     std::vector<float> ssm_dt_bias_host; // [ssm_dt_rank] = [32]
     std::vector<float> ssm_norm_host;    // [ssm_head_v_dim] = [128]
     std::vector<uint16_t> ssm_out_host;  // [n_embd, ssm_d_inner] BF16 on host to save DRAM
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> post_attn_norm;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_gate_up;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_down;
+    // Host-side BF16 cache for fast inference
+    std::vector<uint16_t> w_combined_host;
+    std::vector<uint16_t> ffn_gate_up_host;
+    std::vector<uint16_t> ffn_down_host;
 };
 
 // Full model weight buffers on device DRAM.

@@ -43,6 +43,10 @@ add_library(qwen_engine STATIC host/engine.cpp host/gguf_loader.cpp ../src/token
 target_link_libraries(qwen_engine PUBLIC TT::Metalium)
 target_include_directories(qwen_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/host ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
+# Link ttnn C++ library for device-side ops (matmul, rmsnorm, etc.)
+target_link_libraries(qwen_engine PUBLIC ${TT_METAL_BUILD}/lib/_ttnncpp.so)
+target_include_directories(qwen_engine PUBLIC ${TT_METAL_BUILD}/include)
+
 # Test: forward pass (single token through all layers)
 add_executable(test_forward tests/test_forward.cpp)
 target_link_libraries(test_forward PRIVATE qwen_engine)
