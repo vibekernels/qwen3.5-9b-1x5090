@@ -28,7 +28,6 @@ WORKDIR /root/qwen3.5-9b-1x5090
 
 # Startup script: configure SSH, download model, start server
 RUN printf '#!/bin/bash\n\
-set -e\n\
 ssh-keygen -A\n\
 if [ -n "$PUBLIC_KEY" ]; then\n\
   mkdir -p /root/.ssh\n\
@@ -60,8 +59,10 @@ if [ ! -f "$MODEL_PATH" ]; then\n\
   echo "Download complete."\n\
 fi\n\
 \n\
-# Start the inference server\n\
-exec /root/qwen3.5-9b-1x5090/qwen-server -m "$MODEL_PATH" --host 0.0.0.0 --port 8080\n\
+# Start the inference server (fall back to sleep if it crashes)\n\
+echo "Starting qwen-server with model: $MODEL_PATH"\n\
+/root/qwen3.5-9b-1x5090/qwen-server -m "$MODEL_PATH" --host 0.0.0.0 --port 8080 || \\\n\
+  (echo "Server failed to start, keeping container alive for debugging" && sleep infinity)\n\
 ' > /start.sh && chmod +x /start.sh
 
 EXPOSE 22 8080
