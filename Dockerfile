@@ -26,7 +26,7 @@ RUN cd /root/qwen3.5-9b-1x5090 && make -j$(nproc)
 
 WORKDIR /root/qwen3.5-9b-1x5090
 
-# Startup script: configure SSH, download model, start server
+# Startup script: configure SSH, start server (auto-downloads model)
 RUN printf '#!/bin/bash\n\
 ssh-keygen -A\n\
 if [ -n "$PUBLIC_KEY" ]; then\n\
@@ -41,27 +41,9 @@ grep -q "source /etc/rp_environment" /root/.bashrc 2>/dev/null || \\\n\
   echo "source /etc/rp_environment" >> /root/.bashrc\n\
 /usr/sbin/sshd\n\
 \n\
-# Parse HF_MODEL (format: org/repo-GGUF:quant)\n\
 HF_MODEL="${HF_MODEL:-unsloth/Qwen3.5-9B-GGUF:BF16}"\n\
-REPO="${HF_MODEL%%:*}"\n\
-QUANT="${HF_MODEL##*:}"\n\
-REPO_NAME="${REPO##*/}"\n\
-FILE_STEM="${REPO_NAME%%-GGUF}"\n\
-FILENAME="${FILE_STEM}-${QUANT}.gguf"\n\
-MODEL_PATH="/workspace/models/${FILENAME}"\n\
-\n\
-# Download model weights if not already present\n\
-if [ ! -f "$MODEL_PATH" ]; then\n\
-  echo "Downloading ${FILENAME} from ${REPO}..."\n\
-  mkdir -p /workspace/models\n\
-  wget -O "$MODEL_PATH" \\\n\
-    "https://huggingface.co/${REPO}/resolve/main/${FILENAME}"\n\
-  echo "Download complete."\n\
-fi\n\
-\n\
-# Start the inference server (fall back to sleep if it crashes)\n\
-echo "Starting qwen-server with model: $MODEL_PATH"\n\
-/root/qwen3.5-9b-1x5090/qwen-server -m "$MODEL_PATH" --host 0.0.0.0 --port 8080 || \\\n\
+echo "Starting qwen-server with model: $HF_MODEL"\n\
+/root/qwen3.5-9b-1x5090/qwen-server -m "$HF_MODEL" --host 0.0.0.0 --port 8080 || \\\n\
   (echo "Server failed to start, keeping container alive for debugging" && sleep infinity)\n\
 ' > /start.sh && chmod +x /start.sh
 
