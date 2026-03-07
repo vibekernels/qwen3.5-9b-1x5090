@@ -22,7 +22,8 @@ CU_SOURCES = \
 
 CPP_SOURCES = \
     $(SRC_DIR)/gguf_loader.cpp \
-    $(SRC_DIR)/tokenizer.cpp
+    $(SRC_DIR)/tokenizer.cpp \
+    $(SRC_DIR)/download.cpp
 
 # Object files
 CU_OBJECTS = $(patsubst $(SRC_DIR)/%.cu,$(BUILD_DIR)/%.o,$(CU_SOURCES))

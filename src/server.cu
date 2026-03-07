@@ -1,12 +1,15 @@
 #include "inference.h"
+#include "download.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <mutex>
+#include <thread>
 #include <chrono>
 #include <random>
 #include <sstream>
+#include <atomic>
 
 // Suppress warnings from third-party headers under nvcc
 #pragma nv_diag_suppress 20012
@@ -19,6 +22,12 @@
 using json = nlohmann::json;
 
 static std::mutex g_inference_mutex;
+
+// Server loading state
+enum class ServerState { DOWNLOADING, LOADING, READY, FAILED };
+static std::atomic<ServerState> g_state{ServerState::DOWNLOADING};
+static DownloadProgress g_download_progress;
+static std::string g_error_msg;
 
 static std::string generate_id() {
     static std::mt19937 rng(std::random_device{}());
@@ -54,6 +63,12 @@ static std::string apply_chat_template(const json& messages) {
 }
 
 static void handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+    if (g_state.load() != ServerState::READY) {
+        res.status = 503;
+        res.set_content(R"({"error":{"message":"Model is still loading","type":"server_error"}})", "application/json");
+        return;
+    }
+
     json body;
     try {
         body = json::parse(req.body);
@@ -201,6 +216,30 @@ static void handle_health(const httplib::Request&, httplib::Response& res) {
     res.set_content(R"({"status":"ok"})", "application/json");
 }
 
+static void handle_status(const httplib::Request&, httplib::Response& res) {
+    json status;
+    ServerState state = g_state.load();
+    switch (state) {
+        case ServerState::DOWNLOADING:
+            status["state"] = "downloading";
+            status["downloaded"] = g_download_progress.downloaded.load();
+            status["total"] = g_download_progress.total.load();
+            status["filename"] = g_download_progress.filename;
+            break;
+        case ServerState::LOADING:
+            status["state"] = "loading";
+            break;
+        case ServerState::READY:
+            status["state"] = "ready";
+            break;
+        case ServerState::FAILED:
+            status["state"] = "failed";
+            status["error"] = g_error_msg;
+            break;
+    }
+    res.set_content(status.dump(), "application/json");
+}
+
 static const char* CHAT_HTML = R"html(
 <!DOCTYPE html>
 <html lang="en">
@@ -248,10 +287,27 @@ header .model { font-size: 12px; color: #8b949e; background: #21262d; padding: 2
 #settings { display: flex; gap: 12px; max-width: 780px; margin: 0 auto 8px; align-items: center; font-size: 12px; color: #8b949e; }
 #settings label { display: flex; align-items: center; gap: 4px; }
 #settings input, #settings select { background: #161b22; border: 1px solid #30363d; color: #e6edf3; padding: 2px 6px; border-radius: 4px; font-size: 12px; width: 70px; }
+#loading-overlay { position: fixed; inset: 0; background: #0d1117; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; gap: 16px; }
+#loading-overlay h2 { font-size: 18px; font-weight: 600; }
+#loading-overlay .status-text { font-size: 14px; color: #8b949e; }
+#loading-overlay .progress-bar { width: 320px; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; }
+#loading-overlay .progress-fill { height: 100%; background: #1f6feb; border-radius: 4px; transition: width 0.3s; width: 0%; }
+#loading-overlay .progress-detail { font-size: 12px; color: #484f58; }
+#loading-overlay .error { color: #f85149; font-size: 14px; }
+#loading-overlay .spinner { width: 24px; height: 24px; border: 3px solid #21262d; border-top-color: #1f6feb; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
 </head>
 <body>
+<div id="loading-overlay">
+  <h2>Qwen3.5-9B</h2>
+  <div class="spinner"></div>
+  <div class="status-text" id="load-status">Connecting...</div>
+  <div class="progress-bar" id="progress-bar" style="display:none"><div class="progress-fill" id="progress-fill"></div></div>
+  <div class="progress-detail" id="progress-detail"></div>
+  <div class="error" id="load-error" style="display:none"></div>
+</div>
 <header>
   <h1>Qwen3.5-9B</h1>
   <span class="model">BF16 &bull; CUDA</span>
@@ -270,19 +326,74 @@ header .model { font-size: 12px; color: #8b949e; background: #21262d; padding: 2
 </div>
 <script>
 const chat = document.getElementById('chat');
-const prompt = document.getElementById('prompt');
+const promptEl = document.getElementById('prompt');
 const sendBtn = document.getElementById('send');
 const clearBtn = document.getElementById('clear-btn');
+const overlay = document.getElementById('loading-overlay');
 let messages = [];
 let generating = false;
 
 function autoResize() {
-  prompt.style.height = 'auto';
-  prompt.style.height = Math.min(prompt.scrollHeight, 200) + 'px';
+  promptEl.style.height = 'auto';
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + 'px';
 }
-prompt.addEventListener('input', autoResize);
+promptEl.addEventListener('input', autoResize);
 
 marked.setOptions({ breaks: true, gfm: true });
+
+// Loading state management
+function formatBytes(b) {
+  if (b < 1e6) return (b / 1e3).toFixed(0) + ' KB';
+  if (b < 1e9) return (b / 1e6).toFixed(1) + ' MB';
+  return (b / 1e9).toFixed(2) + ' GB';
+}
+
+async function pollStatus() {
+  const statusEl = document.getElementById('load-status');
+  const progressBar = document.getElementById('progress-bar');
+  const progressFill = document.getElementById('progress-fill');
+  const progressDetail = document.getElementById('progress-detail');
+  const errorEl = document.getElementById('load-error');
+  const spinnerEl = overlay.querySelector('.spinner');
+
+  while (true) {
+    try {
+      const res = await fetch('/api/status');
+      const s = await res.json();
+
+      if (s.state === 'downloading') {
+        progressBar.style.display = '';
+        const pct = s.total > 0 ? (s.downloaded / s.total * 100) : 0;
+        progressFill.style.width = pct.toFixed(1) + '%';
+        statusEl.textContent = 'Downloading model...';
+        if (s.total > 0) {
+          progressDetail.textContent = formatBytes(s.downloaded) + ' / ' + formatBytes(s.total) + ' (' + pct.toFixed(1) + '%)';
+        } else {
+          progressDetail.textContent = formatBytes(s.downloaded);
+        }
+      } else if (s.state === 'loading') {
+        statusEl.textContent = 'Loading model into GPU...';
+        progressBar.style.display = 'none';
+        progressDetail.textContent = '';
+      } else if (s.state === 'ready') {
+        overlay.style.display = 'none';
+        promptEl.focus();
+        return;
+      } else if (s.state === 'failed') {
+        statusEl.textContent = 'Failed to load model';
+        spinnerEl.style.display = 'none';
+        progressBar.style.display = 'none';
+        errorEl.style.display = '';
+        errorEl.textContent = s.error || 'Unknown error';
+        return;
+      }
+    } catch {
+      statusEl.textContent = 'Connecting...';
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+pollStatus();
 
 function renderMarkdown(el, text) {
   try { el.innerHTML = marked.parse(text); } catch { el.textContent = text; }
@@ -302,12 +413,12 @@ function addMessage(role, content) {
 }
 
 async function send() {
-  const text = prompt.value.trim();
+  const text = promptEl.value.trim();
   if (!text || generating) return;
 
   generating = true;
   sendBtn.disabled = true;
-  prompt.value = '';
+  promptEl.value = '';
   autoResize();
 
   messages.push({ role: 'user', content: text });
@@ -358,17 +469,17 @@ async function send() {
   messages.push({ role: 'assistant', content: fullText });
   generating = false;
   sendBtn.disabled = false;
-  prompt.focus();
+  promptEl.focus();
 }
 
 sendBtn.addEventListener('click', send);
-prompt.addEventListener('keydown', (e) => {
+promptEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 clearBtn.addEventListener('click', () => {
   messages = [];
   chat.innerHTML = '';
-  prompt.focus();
+  promptEl.focus();
 });
 </script>
 </body>
@@ -376,14 +487,17 @@ clearBtn.addEventListener('click', () => {
 )html";
 
 int main(int argc, char** argv) {
-    std::string model_path;
+    std::string model_spec;
+    std::string model_dir;
     std::string host = "0.0.0.0";
     int port = 8080;
     int ctx_size = 262144;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
+            model_spec = argv[++i];
+        } else if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
+            model_dir = argv[++i];
         } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             host = argv[++i];
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -393,17 +507,44 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (model_path.empty()) {
-        fprintf(stderr, "Usage: %s -m <model_path> [--host <addr>] [--port <port>] [--ctx-size <n>]\n", argv[0]);
+    if (model_spec.empty()) {
+        fprintf(stderr, "Usage: %s -m <model_or_hf_tag> [--model-dir <dir>] [--host <addr>] [--port <port>] [--ctx-size <n>]\n", argv[0]);
+        fprintf(stderr, "\n  -m   Local .gguf file path, or HuggingFace tag like org/repo:quant\n");
+        fprintf(stderr, "       Example: -m unsloth/Qwen3.5-9B-GGUF:BF16\n");
+        fprintf(stderr, "  --model-dir  Local cache directory (default: ~/.cache/qwen-models)\n");
         return 1;
     }
 
-    printf("Loading model: %s\n", model_path.c_str());
-    if (!load_model_and_tokenizer(model_path.c_str(), ctx_size)) {
-        fprintf(stderr, "Failed to load model\n");
-        return 1;
-    }
-    printf("Model loaded. Context size: %d\n", ctx_size);
+    // Start model download + loading in a background thread
+    std::thread loader([model_spec, model_dir, ctx_size]() {
+        g_state.store(ServerState::DOWNLOADING);
+
+        std::string model_path = resolve_model(model_spec, model_dir,
+            [](int64_t downloaded, int64_t total) {
+                g_download_progress.downloaded.store(downloaded);
+                g_download_progress.total.store(total);
+            });
+
+        if (model_path.empty()) {
+            g_error_msg = "Failed to resolve model: " + model_spec;
+            g_state.store(ServerState::FAILED);
+            return;
+        }
+
+        g_download_progress.filename = model_path;
+        g_state.store(ServerState::LOADING);
+        printf("Loading model: %s\n", model_path.c_str());
+
+        if (!load_model_and_tokenizer(model_path.c_str(), ctx_size)) {
+            g_error_msg = "Failed to load model";
+            g_state.store(ServerState::FAILED);
+            return;
+        }
+
+        printf("Model loaded. Context size: %d\n", ctx_size);
+        g_state.store(ServerState::READY);
+    });
+    loader.detach();
 
     httplib::Server svr;
 
@@ -425,11 +566,13 @@ int main(int argc, char** argv) {
     svr.Post("/v1/chat/completions", handle_chat_completions);
     svr.Get("/v1/models", handle_models);
     svr.Get("/health", handle_health);
+    svr.Get("/api/status", handle_status);
 
     printf("Server listening on %s:%d\n", host.c_str(), port);
     printf("  GET  /                    Chat UI\n");
     printf("  POST /v1/chat/completions\n");
     printf("  GET  /v1/models\n");
+    printf("  GET  /api/status\n");
     printf("  GET  /health\n");
 
     if (!svr.listen(host.c_str(), port)) {

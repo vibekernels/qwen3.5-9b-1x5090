@@ -4,6 +4,7 @@
 #include "tokenizer.h"
 #include "sampling.h"
 #include "inference.h"
+#include "download.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -1200,12 +1201,16 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 }
 
 static void print_usage(const char* prog) {
-    fprintf(stderr, "Usage: %s -m <model_path> -p <prompt> [-n <max_tokens>] [-t <temperature>]\n", prog);
+    fprintf(stderr, "Usage: %s -m <model_or_hf_tag> -p <prompt> [-n <max_tokens>] [-t <temperature>] [--model-dir <dir>]\n", prog);
+    fprintf(stderr, "\n  -m   Local .gguf file path, or HuggingFace tag like org/repo:quant\n");
+    fprintf(stderr, "       Example: -m unsloth/Qwen3.5-9B-GGUF:BF16\n");
+    fprintf(stderr, "  --model-dir  Local cache directory (default: ~/.cache/qwen-models)\n");
 }
 
 #ifndef QWEN_SERVER_BUILD
 int main(int argc, char** argv) {
-    std::string model_path;
+    std::string model_spec;
+    std::string model_dir;
     std::string prompt;
     int max_gen_tokens = 128;
     float temperature = 0.8f;
@@ -1213,21 +1218,31 @@ int main(int argc, char** argv) {
     // Parse args
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
+            model_spec = argv[++i];
         } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             max_gen_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             temperature = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
+            model_dir = argv[++i];
         }
     }
 
-    if (model_path.empty()) {
-        model_path = "/workspace/models/Qwen3.5-9B-BF16.gguf";
+    if (model_spec.empty()) {
+        print_usage(argv[0]);
+        return 1;
     }
     if (prompt.empty()) {
         prompt = "Hello, world!";
+    }
+
+    // Resolve model (downloads from HF if needed)
+    std::string model_path = resolve_model(model_spec, model_dir);
+    if (model_path.empty()) {
+        fprintf(stderr, "Failed to resolve model: %s\n", model_spec.c_str());
+        return 1;
     }
 
     printf("Model: %s\n", model_path.c_str());
